@@ -641,11 +641,11 @@ class DataLoggerUI(QMainWindow):
                 msg.setIcon(QMessageBox.Warning)
                 msg.setWindowTitle("File Exists")
                 msg.setText(f"The file '{name}' already exists in the selected directory.")
-                info = "Choose whether to overwrite (truncate) the file, append to it, or cancel recording."
+                info = "Choose whether to overwrite the file, append to it, or cancel recording."
                 if existing_labels:
                     info += f"\nDetected existing columns: {len(existing_labels)}"
                 msg.setInformativeText(info)
-                overwrite_btn = msg.addButton('Overwrite (truncate)', QMessageBox.AcceptRole)
+                overwrite_btn = msg.addButton('Overwrite', QMessageBox.AcceptRole)
                 append_btn = msg.addButton('Append', QMessageBox.AcceptRole)
                 cancel_btn = msg.addButton('Cancel', QMessageBox.RejectRole)
                 msg.exec_()
@@ -681,8 +681,8 @@ class DataLoggerUI(QMainWindow):
                     msg2.setIcon(QMessageBox.Warning)
                     msg2.setWindowTitle("Column Mismatch")
                     msg2.setText(f"The existing file has {file_n} data columns, but currently {self.n_channels} channels are detected.")
-                    msg2.setInformativeText("Overwrite will truncate the file. Append will continue but may misalign columns. Cancel aborts recording.")
-                    ow_btn = msg2.addButton('Overwrite (truncate)', QMessageBox.AcceptRole)
+                    msg2.setInformativeText("Overwrite will clear the existing data. Append will continue but may misalign columns. Cancel aborts recording.")
+                    ow_btn = msg2.addButton('Overwrite', QMessageBox.AcceptRole)
                     ap_btn = msg2.addButton('Append anyway', QMessageBox.AcceptRole)
                     ca_btn = msg2.addButton('Cancel', QMessageBox.RejectRole)
                     msg2.exec_()
