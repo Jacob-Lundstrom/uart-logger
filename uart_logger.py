@@ -11,7 +11,7 @@ from collections import deque
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, 
                              QWidget, QLineEdit, QLabel, QHBoxLayout,
-                             QPushButton, QFileDialog, QSizePolicy)
+                             QPushButton, QFileDialog, QSizePolicy, QDialog, QMessageBox)
 from PyQt5.QtCore import QTimer
 
 # --- Configuration ---
@@ -28,11 +28,19 @@ class DataLoggerUI(QMainWindow):
         self.resize(800, 600)
 
         # 1. Data Structures
-        # deque is highly optimized for appending to one end and popping from the other
-        self.data_buffer = deque(maxlen=MAX_HISTORY)
+        # Support multiple data channels: a list of deques (one per channel)
+        self.channel_buffers = []  # list of deque(maxlen=MAX_HISTORY)
+        self.n_channels = None
+        self.plot_curves = []
+        self.channel_labels = []
         self.window_size = 100 # Default X-axis sample width
-        # Logging state
-        self.log_dir = os.getcwd()
+        # Logging state: default to a `data` folder next to this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.log_dir = os.path.join(script_dir, 'data')
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         self.recording = False
         self.log_file = None
         self.log_writer = None
@@ -131,8 +139,19 @@ class DataLoggerUI(QMainWindow):
         self.graph.showGrid(x=True, y=True)
         self.layout.addWidget(self.graph)
         
-        # Create the line plot
-        self.plot_curve = self.graph.plot(pen=pg.mkPen(color='b', width=2))
+        # No fixed curve yet — curves are created dynamically when data arrives
+        self.graph.addLegend(offset=(10, 10))
+
+        # Buttons below the plot: edit labels + reset
+        self.buttons_row = QHBoxLayout()
+        self.edit_labels_button = QPushButton("Edit Channel Labels")
+        self.edit_labels_button.clicked.connect(self.edit_channel_labels)
+        self.buttons_row.addWidget(self.edit_labels_button)
+        self.reset_button = QPushButton("Reset Data/Channels")
+        self.reset_button.clicked.connect(self.reset_all)
+        self.buttons_row.addWidget(self.reset_button)
+        self.buttons_row.addStretch()
+        self.layout.addLayout(self.buttons_row)
 
         # 4. Serial & Thread Setup
         self.running = True
@@ -170,18 +189,67 @@ class DataLoggerUI(QMainWindow):
                     decoded_line = raw_bytes.decode('utf-8').strip()
 
                     if decoded_line:
-                        # Parse the data (Assuming one numeric value per line)
-                        # If you have multiple values, split them here
-                        val = float(decoded_line)
+                        # Parse comma-separated values (any number of channels)
+                        parts = [p.strip() for p in decoded_line.split(',') if p.strip() != '']
+                        vals = []
+                        try:
+                            for p in parts:
+                                vals.append(float(p))
+                        except ValueError:
+                            # If any value can't be parsed, skip the whole line
+                            continue
 
-                        # Append to the plot buffer
-                        self.data_buffer.append(val)
+                        # Initialize channel buffers and curves on first valid line
+                        if self.n_channels is None:
+                            self.n_channels = len(vals)
+                        # If more channels appear, expand buffers/curves
+                        if len(vals) > (self.n_channels or 0):
+                            self.n_channels = len(vals)
+
+                        # Ensure channel_buffers length matches n_channels
+                        if len(self.channel_buffers) < self.n_channels:
+                            # create additional deques and plot curves
+                            start_idx = len(self.channel_buffers)
+                            for i in range(start_idx, self.n_channels):
+                                dq = deque(maxlen=MAX_HISTORY)
+                                self.channel_buffers.append(dq)
+                                # ensure a default label exists for this channel
+                                label = f'chan{i+1}'
+                                self.channel_labels.append(label)
+                                # create a new curve with unique color and legend label
+                                pen = pg.mkPen(color=pg.intColor(i), width=2)
+                                curve = self.graph.plot(pen=pen, name=label)
+                                self.plot_curves.append(curve)
+
+                        # If fewer values than channels, pad with nan so buffers stay aligned
+                        if len(vals) < self.n_channels:
+                            vals.extend([float('nan')] * (self.n_channels - len(vals)))
+
+                        # Append values to each channel buffer
+                        for i, v in enumerate(vals[:self.n_channels]):
+                            try:
+                                self.channel_buffers[i].append(v)
+                            except Exception:
+                                pass
 
                         # Log to CSV only when recording is active
                         if self.recording and self.log_writer and self.log_file:
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                             try:
-                                self.log_writer.writerow([timestamp, val])
+                                # write header lazily if needed
+                                if not getattr(self, 'header_written', False):
+                                    # If file was non-empty when opened, assume header already present
+                                    # Otherwise write a header based on current channel count
+                                    header = ['timestamp'] + [self.channel_labels[i] if i < len(self.channel_labels) else f'chan{i+1}' for i in range(self.n_channels or len(vals))]
+                                    try:
+                                        self.log_writer.writerow(header)
+                                        self.log_file.flush()
+                                    except Exception:
+                                        pass
+                                    self.header_written = True
+
+                                row = [timestamp] + [('' if (v is None or (isinstance(v, float) and str(v) == 'nan')) else v) for v in vals[:self.n_channels]]
+                                self.log_writer.writerow(row)
                                 self.log_file.flush()
                             except Exception:
                                 # If writing fails for any reason, stop recording to be safe
@@ -193,18 +261,19 @@ class DataLoggerUI(QMainWindow):
 
     def update_plot(self):
         """Pulls the latest data slice and updates the graph."""
-        if not self.data_buffer:
+        if not self.channel_buffers:
             return
 
-        # Convert deque to a list so we can slice it
-        current_data = list(self.data_buffer)
-        
-        # Apply the moving window requested by the text field
-        if len(current_data) > self.window_size:
-            current_data = current_data[-self.window_size:]
-            
-        # Update the pyqtgraph curve
-        self.plot_curve.setData(current_data)
+        # Update each channel's curve
+        for i, buf in enumerate(self.channel_buffers):
+            data = list(buf)
+            if len(data) > self.window_size:
+                data = data[-self.window_size:]
+            try:
+                # replace nan with None so pyqtgraph can handle gaps
+                self.plot_curves[i].setData(data)
+            except Exception:
+                pass
 
         # Apply Y-axis limits if autoscale is disabled
         if not getattr(self, 'autoscale', True):
@@ -241,6 +310,210 @@ class DataLoggerUI(QMainWindow):
             self.log_dir = selected
             # update the editable field so users can copy/paste or edit further
             self.dir_input.setText(self.log_dir)
+
+    def edit_channel_labels(self):
+        """Open a dialog allowing the user to edit channel labels."""
+        if not self.n_channels:
+            QMessageBox.information(self, "No channels", "No channels detected yet. Wait for data or start recording.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Channel Labels")
+        dlg_layout = QVBoxLayout(dialog)
+        edits = []
+        for i in range(self.n_channels):
+            row = QHBoxLayout()
+            lbl = QLabel(f"Channel {i+1}:")
+            le = QLineEdit(self.channel_labels[i] if i < len(self.channel_labels) else f'chan{i+1}')
+            le.setMinimumWidth(200)
+            row.addWidget(lbl)
+            row.addWidget(le)
+            dlg_layout.addLayout(row)
+            edits.append(le)
+
+        btn_row = QHBoxLayout()
+        import_btn = QPushButton("Import from CSV")
+        btn_row.addWidget(import_btn)
+        btn_row.addStretch()
+        save_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        dlg_layout.addLayout(btn_row)
+
+        save_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        def on_import():
+            filename, _ = QFileDialog.getOpenFileName(self, "Select CSV File", self.log_dir, "CSV Files (*.csv);;All Files (*)")
+            if not filename:
+                return
+            try:
+                with open(filename, newline='') as fh:
+                    rdr = csv.reader(fh)
+                    first = next(rdr, None)
+                    if first is None:
+                        QMessageBox.warning(self, "Empty file", "Selected CSV is empty.")
+                        return
+                    hdr = [s.strip() for s in first]
+                    # If first column is timestamp, drop it
+                    if hdr and hdr[0].lower() in ('timestamp', 'time', 't'):
+                        labels = hdr[1:]
+                    else:
+                        # Decide whether first row is header (non-numeric tokens) or data
+                        is_header = False
+                        for cell in hdr:
+                            try:
+                                float(cell)
+                            except Exception:
+                                is_header = True
+                                break
+                        if is_header:
+                            labels = hdr
+                        else:
+                            # numeric row: use column count to build default labels
+                            labels = [f'chan{i+1}' for i in range(len(hdr))]
+
+                    # Apply labels and adjust channel/curve counts
+                    new_n = len(labels)
+                    # If channels already detected, ignore any imported labels for channels we don't have
+                    if self.n_channels is not None and new_n > self.n_channels:
+                        labels = labels[:self.n_channels]
+                        new_n = self.n_channels
+
+                    if self.n_channels is None:
+                        # No channels detected yet: adopt imported label count
+                        self.n_channels = new_n
+
+                    # expand buffers/curves if needed (only up to new_n)
+                    if len(self.channel_buffers) < new_n:
+                        start_idx = len(self.channel_buffers)
+                        for i in range(start_idx, new_n):
+                            dq = deque(maxlen=MAX_HISTORY)
+                            self.channel_buffers.append(dq)
+                            label = f'chan{i+1}'
+                            self.channel_labels.append(label)
+                            pen = pg.mkPen(color=pg.intColor(i), width=2)
+                            curve = self.graph.plot(pen=pen, name=label)
+                            self.plot_curves.append(curve)
+
+                    # If existing labels present and new labels are a permutation, reorder buffers/curves
+                    if self.channel_labels:
+                        mapping = {lbl: idx for idx, lbl in enumerate(self.channel_labels)}
+                        if all(lbl in mapping for lbl in labels):
+                            new_buffers = []
+                            new_curves = []
+                            for lbl in labels:
+                                idx = mapping[lbl]
+                                new_buffers.append(self.channel_buffers[idx])
+                                new_curves.append(self.plot_curves[idx])
+                            self.channel_buffers = new_buffers
+                            self.plot_curves = new_curves
+
+                    # Finally set labels and refresh legend
+                    self.channel_labels = labels[:]
+                    self.n_channels = len(self.channel_labels)
+                    # If the dialog has fewer edit fields than new labels, insert rows
+                    try:
+                        btn_index = dlg_layout.count() - 1
+                        if btn_index < 0:
+                            btn_index = dlg_layout.count()
+                        if len(edits) < self.n_channels:
+                            for j in range(len(edits), self.n_channels):
+                                row = QHBoxLayout()
+                                lblw = QLabel(f"Channel {j+1}:")
+                                lew = QLineEdit(self.channel_labels[j] if j < len(self.channel_labels) else f'chan{j+1}')
+                                lew.setMinimumWidth(200)
+                                row.addWidget(lblw)
+                                row.addWidget(lew)
+                                dlg_layout.insertLayout(btn_index, row)
+                                edits.append(lew)
+                                btn_index += 1
+                    except Exception:
+                        pass
+
+                    # Update existing edit fields to reflect imported labels
+                    for i, le in enumerate(edits):
+                        try:
+                            le.setText(self.channel_labels[i] if i < len(self.channel_labels) else '')
+                        except Exception:
+                            pass
+
+                    self.update_legend_labels()
+                    QMessageBox.information(self, "Imported", f"Imported {len(self.channel_labels)} labels from CSV.")
+            except Exception as e:
+                QMessageBox.warning(self, "Import failed", f"Failed to read CSV: {e}")
+
+        import_btn.clicked.connect(on_import)
+
+        if dialog.exec_() == QDialog.Accepted:
+            limit = self.n_channels if self.n_channels is not None else len(edits)
+            for i in range(limit):
+                le = edits[i] if i < len(edits) else None
+                lbl_text = (le.text().strip() if (le is not None) else '') or f'chan{i+1}'
+                if i < len(self.channel_labels):
+                    self.channel_labels[i] = lbl_text
+                else:
+                    self.channel_labels.append(lbl_text)
+            # ignore any extra edit fields beyond detected channels
+            self.update_legend_labels()
+
+    def reset_all(self):
+        """Clear all in-memory data, reset detected channels, and optionally clear CSV files."""
+        resp = QMessageBox.question(self, "Reset All", "This will clear all in-memory data and reset detected channels. Continue?", QMessageBox.Yes | QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+
+        # Stop and close recording if active
+        try:
+            if self.recording:
+                self.stop_recording()
+        except Exception:
+            pass
+
+        # Clear buffers
+        try:
+            self.channel_buffers = []
+        except Exception:
+            self.channel_buffers = []
+        self.n_channels = None
+
+        # Clear plot and legend, then recreate legend area
+        try:
+            self.graph.clear()
+        except Exception:
+            pass
+        try:
+            self.plot_curves = []
+            self.channel_labels = []
+            self.graph.addLegend(offset=(10, 10))
+        except Exception:
+            pass
+
+        # Do NOT modify recorded CSV files — preserve all recorded data on disk.
+        QMessageBox.information(self, "Reset", "In-memory data and channels have been reset.")
+
+    def update_legend_labels(self):
+        """Refresh the plot legend to reflect `self.channel_labels`."""
+        try:
+            legend = getattr(self.graph.plotItem, 'legend', None)
+            if legend is None:
+                self.graph.addLegend(offset=(10, 10))
+                legend = self.graph.plotItem.legend
+            else:
+                try:
+                    legend.clear()
+                except Exception:
+                    pass
+
+            for i, curve in enumerate(self.plot_curves):
+                label = self.channel_labels[i] if i < len(self.channel_labels) else f'chan{i+1}'
+                try:
+                    legend.addItem(curve, label)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def parse_y_limits(self):
         """Return (ymin, ymax) floats or (None, None) if invalid."""
@@ -334,8 +607,105 @@ class DataLoggerUI(QMainWindow):
             if not name.lower().endswith('.csv'):
                 name = name + '.csv'
             path = os.path.join(target_dir, name)
-            f = open(path, mode='a', newline='')
+            # If the file already exists, ask the user whether to overwrite, append, or cancel
+            mode = 'a'
+            existing_labels = None
+            if os.path.exists(path):
+                # Read first row to detect header/column count
+                try:
+                    if os.path.getsize(path) > 0:
+                        with open(path, newline='') as fh:
+                            rdr = csv.reader(fh)
+                            first = next(rdr, None)
+                            if first is not None:
+                                hdr = [s.strip() for s in first]
+                                if hdr and hdr[0].lower() in ('timestamp', 'time', 't'):
+                                    existing_labels = hdr[1:]
+                                else:
+                                    # determine if header or numeric row
+                                    is_header = False
+                                    for cell in hdr:
+                                        try:
+                                            float(cell)
+                                        except Exception:
+                                            is_header = True
+                                            break
+                                    if is_header:
+                                        existing_labels = hdr
+                                    else:
+                                        existing_labels = [f'chan{i+1}' for i in range(len(hdr))]
+                except Exception:
+                    existing_labels = None
+
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Warning)
+                msg.setWindowTitle("File Exists")
+                msg.setText(f"The file '{name}' already exists in the selected directory.")
+                info = "Choose whether to overwrite (truncate) the file, append to it, or cancel recording."
+                if existing_labels:
+                    info += f"\nDetected existing columns: {len(existing_labels)}"
+                msg.setInformativeText(info)
+                overwrite_btn = msg.addButton('Overwrite (truncate)', QMessageBox.AcceptRole)
+                append_btn = msg.addButton('Append', QMessageBox.AcceptRole)
+                cancel_btn = msg.addButton('Cancel', QMessageBox.RejectRole)
+                msg.exec_()
+                clicked = msg.clickedButton()
+                if clicked == cancel_btn:
+                    return
+                elif clicked == overwrite_btn:
+                    mode = 'w'
+                else:
+                    mode = 'a'
+
+            # If appending to an existing file with a header, compare column counts
+            if mode == 'a' and existing_labels:
+                file_n = len(existing_labels)
+                if self.n_channels is None:
+                    # adopt labels and channel count from the existing file
+                    self.n_channels = file_n
+                    self.channel_labels = existing_labels[:]
+                    # ensure buffers/curves exist for these channels
+                    if len(self.channel_buffers) < self.n_channels:
+                        start_idx = len(self.channel_buffers)
+                        for i in range(start_idx, self.n_channels):
+                            dq = deque(maxlen=MAX_HISTORY)
+                            self.channel_buffers.append(dq)
+                            label = self.channel_labels[i] if i < len(self.channel_labels) else f'chan{i+1}'
+                            pen = pg.mkPen(color=pg.intColor(i), width=2)
+                            curve = self.graph.plot(pen=pen, name=label)
+                            self.plot_curves.append(curve)
+                    self.update_legend_labels()
+                elif self.n_channels != file_n:
+                    # mismatch: ask user whether to overwrite, append anyway, or cancel
+                    msg2 = QMessageBox(self)
+                    msg2.setIcon(QMessageBox.Warning)
+                    msg2.setWindowTitle("Column Mismatch")
+                    msg2.setText(f"The existing file has {file_n} data columns, but currently {self.n_channels} channels are detected.")
+                    msg2.setInformativeText("Overwrite will truncate the file. Append will continue but may misalign columns. Cancel aborts recording.")
+                    ow_btn = msg2.addButton('Overwrite (truncate)', QMessageBox.AcceptRole)
+                    ap_btn = msg2.addButton('Append anyway', QMessageBox.AcceptRole)
+                    ca_btn = msg2.addButton('Cancel', QMessageBox.RejectRole)
+                    msg2.exec_()
+                    clicked2 = msg2.clickedButton()
+                    if clicked2 == ca_btn:
+                        return
+                    elif clicked2 == ow_btn:
+                        mode = 'w'
+                    else:
+                        mode = 'a'
+
+            f = open(path, mode=mode, newline='')
             writer = csv.writer(f)
+            # remember path and whether header is already present
+            self.log_path = path
+            try:
+                if mode == 'a':
+                    self.header_written = (os.path.getsize(path) > 0)
+                else:
+                    # truncating the file means header must be re-written
+                    self.header_written = False
+            except Exception:
+                self.header_written = False
             # Save handles for the logging thread to use
             self.log_file = f
             self.log_writer = writer
@@ -367,6 +737,8 @@ class DataLoggerUI(QMainWindow):
         finally:
             self.log_file = None
             self.log_writer = None
+            self.log_path = None
+            self.header_written = False
             self.recording = False
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
