@@ -90,12 +90,8 @@ timestamp,Temperature,Pressure
 
 **High Sample Rate / Bursty Display**
 
-At high sample rates (e.g. 1 kHz) the live plot and recorded timestamps may appear bursty — data arrives in discrete clumps rather than continuously. There are two causes:
+At high sample rates (e.g. 1 kHz) the live plot and recorded timestamps may appear bursty — data arrives in discrete clumps rather than continuously. The most common cause is the **USB-serial adapter latency timer**.
 
-1. **USB-serial adapter latency timer.** USB-to-serial adapters (CP210x, FTDI, CH340, etc.) batch incoming bytes and deliver them to the OS on a periodic timer. The default is often **16 ms**, so at 1 kHz you receive 16 samples all at once rather than one per millisecond. Reducing this timer to **1 ms** (the minimum) dramatically smooths both the live display and the recorded timestamps.
+USB-to-serial adapters (CP210x, FTDI, CH340, etc.) batch incoming bytes and deliver them to the OS on a periodic timer. The default is often **16 ms**, so at 1 kHz you receive 16 samples all at once rather than one per millisecond. Reducing this timer to **1 ms** (the minimum) smooths both the live display and the recorded timestamps.
 
-   *Windows:* Device Manager → Ports (COM & LPT) → right-click your adapter → Properties → Port Settings → Advanced → **Latency Timer (msec)** → set to `1`.
-
-2. **Single-line reads.** The logger previously called `readline()` for each sample, which reads one byte at a time internally and amplifies the bursty delivery. The current version reads all bytes available in the OS buffer in a single call (`read(n)`), so each burst is drained immediately.
-
-   The latency timer change (step 1) is the most impactful fix for timestamp accuracy. The code change ensures the buffer is processed as fast as possible once data does arrive.
+*Windows:* Device Manager → Ports (COM & LPT) → right-click your adapter → Properties → Port Settings → Advanced → **Latency Timer (msec)** → set to `1`.
