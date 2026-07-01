@@ -15,8 +15,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
 from PyQt5.QtCore import QTimer
 
 # --- Configuration ---
-SERIAL_PORT = 'COM5'       # Default COM port; can be overridden from command line
-BAUD_RATE = 921600
+SERIAL_PORT = 'COM4'       # Default COM port; can be overridden from command line
+BAUD_RATE = 2000000
 LOG_FILE = 'live_uart_data.csv'
 MAX_HISTORY = 10000        # Maximum samples to hold in RAM
 # ---------------------
@@ -182,9 +182,19 @@ class DataLoggerUI(QMainWindow):
 
     def read_and_log_serial(self):
         """Runs in a background thread to prevent UI freezing."""
+        # Read all available bytes in one call rather than one readline() at a time.
+        # PySerial's readline() calls read(1) per byte, which amplifies the bursty
+        # delivery caused by the OS/USB-serial driver latency timer (~16 ms default).
+        serial_buf = b''
         while self.running:
-            if self.serial_port.in_waiting:
-                raw_bytes = self.serial_port.readline()
+            n = self.serial_port.in_waiting
+            if not n:
+                time.sleep(0.0005)  # yield CPU; well below a 1 kHz sample period
+                continue
+            serial_buf += self.serial_port.read(n)
+
+            while b'\n' in serial_buf:
+                raw_bytes, serial_buf = serial_buf.split(b'\n', 1)
                 try:
                     decoded_line = raw_bytes.decode('utf-8').strip()
 
@@ -256,7 +266,7 @@ class DataLoggerUI(QMainWindow):
                                 self.stop_recording()
 
                 except (UnicodeDecodeError, ValueError):
-                    # Ignores corrupted bytes or non-numeric lines 
+                    # Ignores corrupted bytes or non-numeric lines
                     pass
 
     def update_plot(self):
