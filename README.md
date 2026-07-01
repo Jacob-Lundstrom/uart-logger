@@ -1,22 +1,29 @@
 # UART Logger
 
-UART Logger is a simple Python/Qt desktop tool for streaming serial data, plotting live values, and recording comma-separated measurements to CSV files. It supports multi-channel input, custom channel labels, and CSV-based label import.
+UART Logger is a Python/Qt desktop tool for streaming serial data, plotting live values, and recording comma-separated measurements to CSV files. It supports multi-channel input, custom channel labels, and CSV-based label import. A companion viewer script lets you replay and inspect recorded CSV files without needing a connected device.
 
 **Quick Start**
 - Install Python 3.8+.
 - Install dependencies:
 
 ```bash
-pip install pyqt5 pyqtgraph pyserial
+pip install pyqt5 pyqtgraph pyserial numpy
 ```
 
-- Run the GUI (example):
+- Run the logger (example):
 
 ```bash
 python uart_logger.py --port COM5 --baud 921600
 ```
 
-**Usage & CLI**
+- View a recorded file:
+
+```bash
+python data_viewer.py                      # opens a file picker
+python data_viewer.py data/ekg_demo.csv   # opens a specific file
+```
+
+**Usage & CLI — Logger**
 - `--port`, `-p`: serial port (e.g., COM3 or /dev/ttyUSB0).
 - `--baud`, `-b`: baud rate (default 921600).
 
@@ -66,7 +73,29 @@ timestamp,Temperature,Pressure
 - If the first row starts with `timestamp`, that column is skipped.
 - If the imported CSV has more labels than detected channels, only the first matching labels are used.
 
+**Data Viewer**
+
+`data_viewer.py` is a standalone companion for inspecting recorded CSV files. It uses the same PyQt5/pyqtgraph stack as the logger and opens any CSV written by the logger (or any CSV with the same `timestamp,chan1,...` format).
+
+- **Open CSV…** — file picker defaults to the `data/` folder next to the script.
+- **X Axis** — switch between *Sample Index* and *Time (s)* (seconds elapsed since the first timestamp).
+- **Y Min / Y Max / Autoscale** — same Y-axis controls as the logger.
+- **Channel checkboxes** — toggle individual channels on/off; each checkbox is color-coded to its plot line.
+- Mouse pan and zoom are available via pyqtgraph's built-in interactions (right-click drag to zoom, scroll wheel to zoom an axis, middle-click to pan).
+
 **Notes & Troubleshooting**
 - If the serial port fails to open the app will print an error and exit; verify the port name and permissions.
 - If multiple channels appear, the UI creates one plot per channel and a legend.
 - The application avoids modifying existing recorded CSV files except when you explicitly choose "Overwrite".
+
+**High Sample Rate / Bursty Display**
+
+At high sample rates (e.g. 1 kHz) the live plot and recorded timestamps may appear bursty — data arrives in discrete clumps rather than continuously. There are two causes:
+
+1. **USB-serial adapter latency timer.** USB-to-serial adapters (CP210x, FTDI, CH340, etc.) batch incoming bytes and deliver them to the OS on a periodic timer. The default is often **16 ms**, so at 1 kHz you receive 16 samples all at once rather than one per millisecond. Reducing this timer to **1 ms** (the minimum) dramatically smooths both the live display and the recorded timestamps.
+
+   *Windows:* Device Manager → Ports (COM & LPT) → right-click your adapter → Properties → Port Settings → Advanced → **Latency Timer (msec)** → set to `1`.
+
+2. **Single-line reads.** The logger previously called `readline()` for each sample, which reads one byte at a time internally and amplifies the bursty delivery. The current version reads all bytes available in the OS buffer in a single call (`read(n)`), so each burst is drained immediately.
+
+   The latency timer change (step 1) is the most impactful fix for timestamp accuracy. The code change ensures the buffer is processed as fast as possible once data does arrive.
